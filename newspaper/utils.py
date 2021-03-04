@@ -20,15 +20,48 @@ import sys
 import threading
 import time
 
+from configparser import ConfigParser
+
 from hashlib import sha1
 
 from bs4 import BeautifulSoup
 
 from . import settings
 
+from psycopg2 import connect, DatabaseError
+from urllib.parse import urlparse
+
 log = logging.getLogger(__name__)
 log.setLevel(logging.DEBUG)
 
+def db(filename='database.ini', section='postgresql'):
+    parser = ConfigParser()
+    parser.read(f'{os.getcwd()}/{filename}')
+
+    output = {}
+
+    if parser.has_section(section):
+        params = parser.items(section)
+        for param in params:
+            output[param[0]] = param[1]
+    else:
+        raise Exception('Section {0} not found in the {1} file'.format(section, filename))
+
+    return output
+
+def db_connect():
+    c = None
+
+    try:
+        params = db()
+
+        c = connect(**params)
+    except (Exception, DatabaseError) as e:
+        print(e)
+
+    return c
+
+conn = db_connect()
 
 class FileHelper(object):
     @staticmethod
@@ -212,35 +245,6 @@ def to_valid_filename(s):
     return ''.join(c for c in s if c in valid_chars)
 
 
-def cache_disk(seconds=(86400 * 5), cache_folder="/tmp"):
-    """Caching extracting category locations & rss feeds for 5 days
-    """
-    def do_cache(function):
-        def inner_function(*args, **kwargs):
-            """Calculate a cache key based on the decorated method signature
-            args[1] indicates the domain of the inputs, we hash on domain!
-            """
-            key = sha1((str(args[1]) +
-                        str(kwargs)).encode('utf-8')).hexdigest()
-            filepath = os.path.join(cache_folder, key)
-
-            # verify that the cached object exists and is less than
-            # X seconds old
-            if os.path.exists(filepath):
-                modified = os.path.getmtime(filepath)
-                age_seconds = time.time() - modified
-                if age_seconds < seconds:
-                    return pickle.load(open(filepath, "rb"))
-
-            # call the decorated function...
-            result = function(*args, **kwargs)
-            # ... and save the cached object for next time
-            pickle.dump(result, open(filepath, "wb"))
-            return result
-        return inner_function
-    return do_cache
-
-
 def print_duration(method):
     """Prints out the runtime duration of a method in seconds
     """
@@ -286,48 +290,22 @@ def memoize_articles(source, articles):
     it means the link must not be an article, because article urls
     change as time passes. This method also uniquifies articles.
     """
-    source_domain = source.domain
-    config = source.config
 
     if len(articles) == 0:
         return []
 
-    memo = {}
-    cur_articles = {article.url: article for article in articles}
-    d_pth = os.path.join(settings.MEMO_DIR, domain_to_filename(source_domain))
+    current_articles = {article.url: article for article in articles}
 
-    if os.path.exists(d_pth):
-        f = codecs.open(d_pth, 'r', 'utf8')
-        urls = f.readlines()
-        f.close()
-        urls = [u.strip() for u in urls]
+    for url, article in list(current_articles.items()):
+        with conn.cursor() as c:
+            u = urlparse(url)
+            c.execute('SELECT id FROM urls WHERE href = %s', (f'{u.netloc}{u.path}',))
+            existing_id = c.fetchone()
 
-        memo = {url: True for url in urls}
-        # prev_length = len(memo)
-        for url, article in list(cur_articles.items()):
-            if memo.get(url):
-                del cur_articles[url]
+            if existing_id != None:
+                del current_articles[url]
 
-        valid_urls = list(memo.keys()) + list(cur_articles.keys())
-
-        memo_text = '\r\n'.join(
-            [href.strip() for href in (valid_urls)])
-    # Our first run with memoization, save every url as valid
-    else:
-        memo_text = '\r\n'.join(
-            [href.strip() for href in list(cur_articles.keys())])
-
-    # new_length = len(cur_articles)
-    if len(memo) > config.MAX_FILE_MEMO:
-        # We still keep current batch of articles though!
-        log.critical('memo overflow, dumping')
-        memo_text = ''
-
-    # TODO if source: source.write_upload_times(prev_length, new_length)
-    ff = codecs.open(d_pth, 'w', 'utf-8')
-    ff.write(memo_text)
-    ff.close()
-    return list(cur_articles.values())
+    return list(current_articles.values())
 
 
 def get_useragent():
